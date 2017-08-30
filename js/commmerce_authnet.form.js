@@ -103,7 +103,6 @@
         else {
           console.log(response);
           console.log(response.opaqueData);
-          debugger;
           processTransactionDataFromAnet(response.opaqueData);
         }
       };
