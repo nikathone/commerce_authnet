@@ -2,12 +2,12 @@
 
 namespace Drupal\commerce_authnet\Plugin\Commerce\PaymentGateway;
 
+use CommerceGuys\AuthNet\DataTypes\OpaqueData;
 use CommerceGuys\AuthNet\Response\ResponseInterface;
 use Drupal\commerce_payment\CreditCard;
 use Drupal\commerce_payment\Entity\PaymentInterface;
 use Drupal\commerce_payment\Entity\PaymentMethodInterface;
 use Drupal\commerce_payment\Exception\HardDeclineException;
-use Drupal\commerce_payment\Exception\InvalidRequestException;
 use Drupal\commerce_payment\Exception\InvalidResponseException;
 use Drupal\commerce_payment\Exception\PaymentGatewayException;
 use Drupal\commerce_payment\PaymentMethodTypeManager;
@@ -26,6 +26,7 @@ use CommerceGuys\AuthNet\DataTypes\BillTo;
 use CommerceGuys\AuthNet\DataTypes\CreditCard as CreditCardDataType;
 use CommerceGuys\AuthNet\DataTypes\MerchantAuthentication;
 use CommerceGuys\AuthNet\DataTypes\Order as OrderDataType;
+use CommerceGuys\AuthNet\DataTypes\OpaqueData as OpaqueDataType;
 use CommerceGuys\AuthNet\DataTypes\PaymentProfile;
 use CommerceGuys\AuthNet\DataTypes\Profile;
 use CommerceGuys\AuthNet\DataTypes\TransactionRequest;
@@ -39,8 +40,11 @@ use Symfony\Component\DependencyInjection\ContainerInterface;
  *
  * @CommercePaymentGateway(
  *   id = "authorizenet",
- *   label = "Authorize.net",
+ *   label = "Authorize.net Accept.js",
  *   display_label = "Authorize.net",
+ *   forms = {
+ *     "add-payment-method" = "Drupal\commerce_authnet\PluginForm\AuthorizeNet\PaymentMethodAddForm",
+ *   },
  *   payment_method_types = {"credit_card"},
  *   credit_card_types = {
  *     "amex", "dinersclub", "discover", "jcb", "mastercard", "visa"
@@ -82,6 +86,7 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
       'sandbox' => ($this->getMode() == 'test'),
       'api_login' => $this->configuration['api_login'],
       'transaction_key' => $this->configuration['transaction_key'],
+      'client_key' => $this->configuration['client_key'],
     ]);
   }
 
@@ -109,6 +114,7 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
     return [
       'api_login' => '',
       'transaction_key' => '',
+      'client_key' => '',
       'transaction_type' => TransactionRequest::AUTH_ONLY,
     ] + parent::defaultConfiguration();
   }
@@ -124,12 +130,21 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
       '#default_value' => $this->configuration['api_login'],
       '#required' => TRUE,
     ];
+
     $form['transaction_key'] = [
       '#type' => 'textfield',
       '#title' => $this->t('Transaction Key'),
       '#default_value' => $this->configuration['transaction_key'],
       '#required' => TRUE,
     ];
+
+    $form['client_key'] = [
+      '#type' => 'textfield',
+      '#title' => $this->t('Client Key'),
+      '#default_value' => $this->configuration['client_key'],
+      '#required' => TRUE,
+    ];
+
     $form['transaction_type'] = [
       '#type' => 'radios',
       '#title' => $this->t('Default credit card transaction type'),
@@ -180,8 +195,23 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
       $values = $form_state->getValue($form['#parents']);
       $this->configuration['api_login'] = $values['api_login'];
       $this->configuration['transaction_key'] = $values['transaction_key'];
+      $this->configuration['client_key'] = $values['client_key'];
       $this->configuration['transaction_type'] = $values['transaction_type'];
     }
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function getClientKey() {
+    return $this->configuration['client_key'];
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function getApiLogin() {
+    return $this->configuration['api_login'];
   }
 
   /**
@@ -196,24 +226,25 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
     $owner = $payment_method->getOwner();
     $customer_id = $this->getRemoteCustomerId($owner);
 
-    $transactionRequest = new TransactionRequest([
+    // Transaction request
+    $transaction_request = new TransactionRequest([
       'transactionType' => ($capture) ? TransactionRequest::AUTH_CAPTURE : TransactionRequest::AUTH_ONLY,
       'amount' => $payment->getAmount()->getNumber(),
     ]);
     // @todo update SDK to support data type like this.
-    $transactionRequest->addDataType(new Profile([
+    $transaction_request->addDataType(new Profile([
       'customerProfileId' => $customer_id,
       'paymentProfile' => [
         'paymentProfileId' => $payment_method->getRemoteId(),
       ],
     ]));
-    $transactionRequest->addOrder(new OrderDataType([
+    $transaction_request->addOrder(new OrderDataType([
       'invoiceNumber' => $order->getOrderNumber(),
     ]));
-    $transactionRequest->addData('customerIP', $order->getIpAddress());
+    $transaction_request->addData('customerIP', $order->getIpAddress());
 
     $request = new CreateTransactionRequest($this->authnetConfiguration, $this->httpClient);
-    $request->setTransactionRequest($transactionRequest);
+    $request->setTransactionRequest($transaction_request);
     $response = $request->execute();
 
     if ($response->getResultCode() != 'Ok') {
@@ -342,16 +373,40 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
    * @todo Needs kernel test
    */
   public function createPaymentMethod(PaymentMethodInterface $payment_method, array $payment_details) {
-    $remote_payment_method = $this->doCreatePaymentMethod($payment_method, $payment_details);
+    $owner = $payment_method->getOwner();
+    $required_keys = [
+      'data_descriptor', 'data_value'
+    ];
+    foreach ($required_keys as $required_key) {
+      if (empty($payment_details[$required_key])) {
+        throw new \InvalidArgumentException(sprintf('$payment_details must contain the %s key.', $required_key));
+      }
+    }
 
-    $payment_method->card_type = $remote_payment_method['card_type'];
+    if ($owner->isAuthenticated()) {
+      $remote_payment_method = $this->doCreatePaymentMethod($payment_method, $payment_details);
+    }
+    else {
+      $remote_payment_method = [
+        'token' => $payment_details['data_value'],
+        'data_descriptor' => $payment_details['data_descriptor'],
+        'data_value' => $payment_details['data_value'],
+        'last4' => $payment_details['last4'],
+        'expiration_month' => $payment_details['expiration_month'],
+        'expiration_year' => $payment_details['expiration_year'],
+      ];
+    }
+    $expires = CreditCard::calculateExpirationTimestamp($remote_payment_method['expiration_month'], $remote_payment_method['expiration_year']);
+
+    $payment_method->data_descriptor = $remote_payment_method['data_descriptor'];
+    $payment_method->data_value = $remote_payment_method['data_value'];
+
+    $payment_method->card_type = $this->mapCreditCardType($remote_payment_method['card_type']);
     $payment_method->card_number = $remote_payment_method['last4'];
     $payment_method->card_exp_month = $remote_payment_method['expiration_month'];
     $payment_method->card_exp_year = $remote_payment_method['expiration_year'];
     $payment_method->setRemoteId($remote_payment_method['token']);
-    $expires = CreditCard::calculateExpirationTimestamp($remote_payment_method['expiration_month'], $remote_payment_method['expiration_year']);
     $payment_method->setExpiresTime($expires);
-
     $payment_method->save();
   }
 
@@ -376,11 +431,12 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
    *   - expiration_year: The expiration year.
    */
   protected function doCreatePaymentMethod(PaymentMethodInterface $payment_method, array $payment_details) {
-    $card_type = CreditCard::detectType($payment_details['number'])->getId();
     $owner = $payment_method->getOwner();
     $customer_id = NULL;
-    if ($owner->isAuthenticated()) {
+    $customer_data = [];
+    if ($owner && !$owner->isAnonymous()) {
       $customer_id = $this->getRemoteCustomerId($owner);
+      $customer_data['email'] = $owner->getEmail();
     }
 
     if ($customer_id) {
@@ -469,12 +525,22 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
       }
     }
 
+    // Maybe we should make sure that this is going to be a string before calling an explode on it.
+    \Drupal::logger('commerce_authnet')->info('<pre>' . print_r($response->validationDirectResponse, TRUE) . '</pre>');
+    $validation_direct_response = explode(',', $response->validationDirectResponse);
+    // Assuming the explode is working card_type is at index 51 and mask card number at index 50
+    // on the form XXXX1111. Not sure if we should use this to get last4 and remove the one in JS.
+    // The explode doesn't work as expected I guess we are screwed.
+    $card_type = $validation_direct_response[51];
+
     return [
       'token' => $payment_profile_id,
+      'data_descriptor' => $payment_details['data_descriptor'],
+      'data_value' => $payment_details['data_value'],
       'card_type' => $card_type,
-      'last4' => substr($payment_details['number'], -4),
-      'expiration_month' => $payment_details['expiration']['month'],
-      'expiration_year' => $payment_details['expiration']['year'],
+      'last4' => $payment_details['last4'],
+      'expiration_month' => $payment_details['expiration_month'],
+      'expiration_year' => $payment_details['expiration_year'],
     ];
   }
 
@@ -511,10 +577,9 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
       'country' => $address->getCountryCode(),
       // @todo support adding phone and fax
     ]));
-    $payment_profile->addPayment(new CreditCardDataType([
-      'cardNumber' => $payment_details['number'],
-      'expirationDate' => $payment_details['expiration']['year'] . '-' . str_pad($payment_details['expiration']['month'], 2, '0', STR_PAD_LEFT),
-      'cardCode' => $payment_details['security_code'],
+    $payment_profile->addPayment(new OpaqueDataType([
+      'dataDescriptor' => $payment_details['data_descriptor'],
+      'dataValue' => $payment_details['data_value'],
     ]));
     return $payment_profile;
   }
