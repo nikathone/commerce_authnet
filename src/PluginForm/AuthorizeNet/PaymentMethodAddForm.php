@@ -126,6 +126,13 @@ class PaymentMethodAddForm extends BasePaymentMethodAddForm {
    */
   public function submitCreditCardForm(array $element, FormStateInterface $form_state) {
     // The payment gateway plugin will process the submitted payment details.
+    $values = $form_state->getValues();
+    if (!empty($values['contact_information']['email'])) {
+      // then we are dealing with anonymous user. Adding a customer email.
+      $payment_details = $values['payment_information']['add_payment_method']['payment_details'];
+      $payment_details['customer_email'] = $values['contact_information']['email'];
+      $form_state->setValue(['payment_information', 'add_payment_method', 'payment_details'], $payment_details);
+    }
   }
 
 }

@@ -4,7 +4,6 @@ namespace Drupal\commerce_authnet\Plugin\Commerce\PaymentGateway;
 
 use CommerceGuys\AuthNet\DataTypes\OpaqueData;
 use CommerceGuys\AuthNet\Response\ResponseInterface;
-use Drupal\commerce_payment\CreditCard;
 use Drupal\commerce_payment\Entity\PaymentInterface;
 use Drupal\commerce_payment\Entity\PaymentMethodInterface;
 use Drupal\commerce_payment\Exception\HardDeclineException;
@@ -224,20 +223,30 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
 
     $order = $payment->getOrder();
     $owner = $payment_method->getOwner();
-    $customer_id = $this->getRemoteCustomerId($owner);
+    $customer_profile_id = $this->getRemoteCustomerId($owner);
+
+    if (!$customer_profile_id) {
+      // This probably an anonymous user the we get the customer profile and
+      // payment profile ids from the payment method remote id.
+      list($customer_profile_id, $payment_profile_id) = explode('_', $payment_method->getRemoteId());
+    }
+    else {
+      $payment_profile_id = $payment_method->getRemoteId();
+    }
 
     // Transaction request
     $transaction_request = new TransactionRequest([
       'transactionType' => ($capture) ? TransactionRequest::AUTH_CAPTURE : TransactionRequest::AUTH_ONLY,
       'amount' => $payment->getAmount()->getNumber(),
     ]);
+
     // @todo update SDK to support data type like this.
-    $transaction_request->addDataType(new Profile([
-      'customerProfileId' => $customer_id,
-      'paymentProfile' => [
-        'paymentProfileId' => $payment_method->getRemoteId(),
-      ],
-    ]));
+    // Initializing the profile to charge and adding it to the transaction.
+    $profile_to_charge = new Profile(['customerProfileId' => $customer_profile_id]);
+    $profile_to_charge->addData('paymentProfile', ['paymentProfileId' => $payment_profile_id]);
+    $transaction_request->addData('profile', $profile_to_charge->toArray());
+
+    // Adding order information to the transaction
     $transaction_request->addOrder(new OrderDataType([
       'invoiceNumber' => $order->getOrderNumber(),
     ]));
@@ -373,7 +382,6 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
    * @todo Needs kernel test
    */
   public function createPaymentMethod(PaymentMethodInterface $payment_method, array $payment_details) {
-    $owner = $payment_method->getOwner();
     $required_keys = [
       'data_descriptor', 'data_value'
     ];
@@ -383,29 +391,22 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
       }
     }
 
-    if ($owner->isAuthenticated()) {
-      $remote_payment_method = $this->doCreatePaymentMethod($payment_method, $payment_details);
-    }
-    else {
-      $remote_payment_method = [
-        'token' => $payment_details['data_value'],
-        'data_descriptor' => $payment_details['data_descriptor'],
-        'data_value' => $payment_details['data_value'],
-        'last4' => $payment_details['last4'],
-        'expiration_month' => $payment_details['expiration_month'],
-        'expiration_year' => $payment_details['expiration_year'],
-      ];
-    }
-    $expires = CreditCard::calculateExpirationTimestamp($remote_payment_method['expiration_month'], $remote_payment_method['expiration_year']);
+    $remote_payment_method = $this->doCreatePaymentMethod($payment_method, $payment_details);
 
-    $payment_method->data_descriptor = $remote_payment_method['data_descriptor'];
-    $payment_method->data_value = $remote_payment_method['data_value'];
-
+    // @todo Make payment methods reusable. Currently they represent 15min nonce.
+    // @see https://community.developer.authorize.net/t5/Integration-and-Testing/Question-about-tokens-transaction-keys/td-p/56689
+    // "You are correct that the Accept.js payment nonce must be used within 15 minutes before it expires."
+    // Meet specific requirements for reusable, permanent methods.
+    $payment_method->setReusable(FALSE);
     $payment_method->card_type = $this->mapCreditCardType($remote_payment_method['card_type']);
     $payment_method->card_number = $remote_payment_method['last4'];
     $payment_method->card_exp_month = $remote_payment_method['expiration_month'];
     $payment_method->card_exp_year = $remote_payment_method['expiration_year'];
     $payment_method->setRemoteId($remote_payment_method['token']);
+
+    // OpaqueData expire after 15min. We reduce that time by 5s to account for the
+    // time it took to do the server request after the JS tokenization.
+    $expires = $this->time->getRequestTime() + (15 * 60) - 5;
     $payment_method->setExpiresTime($expires);
     $payment_method->save();
   }
@@ -432,17 +433,17 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
    */
   protected function doCreatePaymentMethod(PaymentMethodInterface $payment_method, array $payment_details) {
     $owner = $payment_method->getOwner();
-    $customer_id = NULL;
+    $customer_profile_id = NULL;
     $customer_data = [];
     if ($owner && !$owner->isAnonymous()) {
-      $customer_id = $this->getRemoteCustomerId($owner);
+      $customer_profile_id = $this->getRemoteCustomerId($owner);
       $customer_data['email'] = $owner->getEmail();
     }
 
-    if ($customer_id) {
-      $payment_profile = $this->buildCustomerPaymentProfile($payment_method, $payment_details, $customer_id);
+    if ($customer_profile_id) {
+      $payment_profile = $this->buildCustomerPaymentProfile($payment_method, $payment_details, $customer_profile_id);
       $request = new CreateCustomerPaymentProfileRequest($this->authnetConfiguration, $this->httpClient);
-      $request->setCustomerProfileId($customer_id);
+      $request->setCustomerProfileId($customer_profile_id);
       $request->setPaymentProfile($payment_profile);
       $response = $request->execute();
 
@@ -484,7 +485,7 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
         $profile = new Profile([
           // @todo how to allow altering.
           'merchantCustomerId' => $owner->id() . '_' . $this->time->getRequestTime(),
-          'email' => $owner->getEmail(),
+          'email' => $payment_details['customer_email'],
         ]);
       }
       $profile->addPaymentProfile($this->buildCustomerPaymentProfile($payment_method, $payment_details));
@@ -493,16 +494,17 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
 
       if ($response->getResultCode() == 'Ok') {
         $payment_profile_id = $response->customerPaymentProfileIdList->numericString;
+        $customer_profile_id = $response->customerProfileId;
       }
       else {
         // Handle duplicate.
         if ($response->getMessages()[0]->getCode() == 'E00039') {
           $result = array_filter(explode(' ', $response->getMessages()[0]->getText()), 'is_numeric');
-          $customer_id = reset($result);
+          $customer_profile_id = reset($result);
 
-          $payment_profile = $this->buildCustomerPaymentProfile($payment_method, $payment_details, $customer_id);
+          $payment_profile = $this->buildCustomerPaymentProfile($payment_method, $payment_details, $customer_profile_id);
           $request = new CreateCustomerPaymentProfileRequest($this->authnetConfiguration, $this->httpClient);
-          $request->setCustomerProfileId($customer_id);
+          $request->setCustomerProfileId($customer_profile_id);
           $request->setPaymentProfile($payment_profile);
           $response = $request->execute();
 
@@ -520,21 +522,35 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
       }
 
       if ($owner) {
-        $this->setRemoteCustomerId($owner, $response->customerProfileId);
+        $this->setRemoteCustomerId($owner, $customer_profile_id);
         $owner->save();
       }
     }
 
     // Maybe we should make sure that this is going to be a string before calling an explode on it.
-    \Drupal::logger('commerce_authnet')->info('<pre>' . print_r($response->validationDirectResponse, TRUE) . '</pre>');
-    $validation_direct_response = explode(',', $response->validationDirectResponse);
+    if ($owner->isAuthenticated()) {
+      $validation_direct_response = explode(',', $response->contents()->validationDirectResponse);
+
+      // when user is authenticated we can retrieve customer profile from the user entity so
+      // we only need to save the payment profile id as token.
+      $token = $payment_profile_id;
+    }
+    else {
+      // somehow for anonymous user it's returning this way
+      $validation_direct_response = explode(',', $response->contents()->validationDirectResponseList->string);
+
+      // For anonymous user we use both customer id
+      // and payment profile id as token.
+      $token = $customer_profile_id . '_' . $payment_profile_id;
+    }
+
     // Assuming the explode is working card_type is at index 51 and mask card number at index 50
     // on the form XXXX1111. Not sure if we should use this to get last4 and remove the one in JS.
     // The explode doesn't work as expected I guess we are screwed.
     $card_type = $validation_direct_response[51];
 
     return [
-      'token' => $payment_profile_id,
+      'token' => $token,
       'data_descriptor' => $payment_details['data_descriptor'],
       'data_value' => $payment_details['data_value'],
       'card_type' => $card_type,
@@ -558,13 +574,9 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
    *   The payment profile data type.
    */
   protected function buildCustomerPaymentProfile(PaymentMethodInterface $payment_method, array $payment_details, $customer_id = NULL) {
-    $payment_profile = new PaymentProfile([
-      // @todo how to allow customizing this.
-      'customerType' => 'individual',
-    ]);
     /** @var \Drupal\address\AddressInterface $address */
     $address = $payment_method->getBillingProfile()->address->first();
-    $payment_profile->addBillTo(new BillTo([
+    $bill_to = new BillTo([
       // @todo how to allow customizing this.
       'firstName' => $address->getGivenName(),
       'lastName' => $address->getFamilyName(),
@@ -576,11 +588,20 @@ class AuthorizeNet extends OnsitePaymentGatewayBase implements AuthorizeNetInter
       'zip' => $address->getPostalCode(),
       'country' => $address->getCountryCode(),
       // @todo support adding phone and fax
-    ]));
-    $payment_profile->addPayment(new OpaqueDataType([
+    ]);
+
+    $payment = new OpaqueData([
       'dataDescriptor' => $payment_details['data_descriptor'],
       'dataValue' => $payment_details['data_value'],
-    ]));
+    ]);
+
+    $payment_profile = new PaymentProfile([
+      // @todo how to allow customizing this.
+      'customerType' => 'individual',
+    ]);
+    $payment_profile->addBillTo($bill_to);
+    $payment_profile->addPayment($payment);
+
     return $payment_profile;
   }
 
